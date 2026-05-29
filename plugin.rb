@@ -84,20 +84,42 @@ end
 # Register the middleware before Rails freezes the stack. A Railtie
 # inserted while the plugin file is being evaluated runs at the right
 # initialisation phase.
+#
+# Insertion ordering is a security property: our middleware must run
+# AFTER upstream Middleware::EnforceHostname so that env[HTTP_HOST] has
+# already been validated against host_names. Without that validation,
+# stashing the raw Host header into Thread.current would let an
+# attacker-controlled value propagate into canonical / og:url /
+# redirect Location / email-link emission -- a host-injection vector.
+# So if EnforceHostname is unavailable (SKIP_ENFORCE_HOSTNAME=1 made
+# upstream skip the require, or another component removed it from the
+# stack), we disable the plugin and warn loudly rather than fall back
+# to installing the middleware in an unsafe position.
 class ::MultiHostnameRailtie < Rails::Railtie
+  WARN_MSG =
+    "[discourse-multi-hostname-canonical] " \
+    "Middleware::EnforceHostname not present in the middleware stack; " \
+    "plugin disabled. Host validation is a prerequisite -- without it, " \
+    "stashing env[HTTP_HOST] would be a host-injection vector. " \
+    "Unset SKIP_ENFORCE_HOSTNAME (or set it to 0) to enable the plugin."
+
   initializer "multi_hostname_canonical.add_middleware",
               before: :build_middleware_stack do |app|
     begin
       app.config.middleware.insert_after \
         Middleware::EnforceHostname,
         ::MultiHostnameMiddleware
-    rescue NameError, RuntimeError
-      # EnforceHostname is absent (SKIP_ENFORCE_HOSTNAME=1 skips the
-      # require -> NameError) or not in the middleware stack
-      # (insert_after raises RuntimeError "No such middleware to
-      # insert after: ..."). Fall back to appending at the end of the
-      # chain so we still wrap requests.
-      app.config.middleware.use ::MultiHostnameMiddleware
+    rescue NameError
+      # SKIP_ENFORCE_HOSTNAME=1 made upstream skip the require so the
+      # constant is undefined.
+      warn WARN_MSG
+    rescue RuntimeError => e
+      # ActionDispatch::MiddlewareStack#insert_after raises a bare
+      # RuntimeError ("No such middleware to insert after: ...") when
+      # the target middleware is missing from the stack. Re-raise any
+      # other RuntimeError so unrelated failures are not swallowed.
+      raise unless e.message.include?("No such middleware to insert after")
+      warn WARN_MSG
     end
   end
 end
