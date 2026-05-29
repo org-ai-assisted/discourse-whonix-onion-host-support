@@ -91,9 +91,12 @@ class ::MultiHostnameRailtie < Rails::Railtie
       app.config.middleware.insert_after \
         Middleware::EnforceHostname,
         ::MultiHostnameMiddleware
-    rescue NameError
-      # EnforceHostname is absent in development; insert at the late
-      # end of the chain so we still wrap requests.
+    rescue NameError, RuntimeError
+      # EnforceHostname is absent (SKIP_ENFORCE_HOSTNAME=1 skips the
+      # require -> NameError) or not in the middleware stack
+      # (insert_after raises RuntimeError "No such middleware to
+      # insert after: ..."). Fall back to appending at the end of the
+      # chain so we still wrap requests.
       app.config.middleware.use ::MultiHostnameMiddleware
     end
   end
