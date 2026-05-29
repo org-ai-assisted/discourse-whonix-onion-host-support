@@ -105,20 +105,23 @@ class ::MultiHostnameRailtie < Rails::Railtie
 
   initializer "multi_hostname_canonical.add_middleware",
               before: :build_middleware_stack do |app|
-    begin
-      app.config.middleware.insert_after \
-        Middleware::EnforceHostname,
-        ::MultiHostnameMiddleware
-    rescue NameError
+    if defined?(Middleware::EnforceHostname)
+      begin
+        app.config.middleware.insert_after \
+          Middleware::EnforceHostname,
+          ::MultiHostnameMiddleware
+      rescue RuntimeError => e
+        # ActionDispatch::MiddlewareStack#insert_after raises a bare
+        # RuntimeError ("No such middleware to insert after: ...") when
+        # the target middleware is missing from the stack. Re-raise
+        # any other RuntimeError so unrelated failures are not
+        # swallowed.
+        raise unless e.message.include?("No such middleware to insert after")
+        warn WARN_MSG
+      end
+    else
       # SKIP_ENFORCE_HOSTNAME=1 made upstream skip the require so the
       # constant is undefined.
-      warn WARN_MSG
-    rescue RuntimeError => e
-      # ActionDispatch::MiddlewareStack#insert_after raises a bare
-      # RuntimeError ("No such middleware to insert after: ...") when
-      # the target middleware is missing from the stack. Re-raise any
-      # other RuntimeError so unrelated failures are not swallowed.
-      raise unless e.message.include?("No such middleware to insert after")
       warn WARN_MSG
     end
   end
