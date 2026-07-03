@@ -15,16 +15,15 @@
 #   host_names.first. Needs DISCOURSE_BACKUP_HOSTNAME=<onion> in
 #   containers/app.yml (populates database.yml host_names with the onion).
 # .
-#   Part B -- per-host CSP. Discourse's CSP middleware keys both the base_url
-#   protocol (lib/content_security_policy/middleware.rb) and the
-#   upgrade-insecure-requests directive (lib/content_security_policy/default.rb)
-#   off the GLOBAL SiteSetting.force_https. With force_https on (as any HTTPS
-#   clearnet site has it), the http:// onion vhost therefore receives an
-#   https:// base_url AND upgrade-insecure-requests -- which forces every
-#   subresource fetch to https and breaks the onion. Part B scopes force_https
-#   to false for the duration of CSP building on .onion requests only, so the
-#   onion emits Discourse's own nonce / strict-dynamic CSP with http origins
-#   and no upgrade-insecure-requests. Clearnet is unaffected.
+#   Part B -- per-host CSP. Discourse's CSP adds upgrade-insecure-requests when
+#   SiteSetting.force_https is on (as any HTTPS clearnet site has it), which
+#   forces every subresource fetch to https and breaks the http:// onion vhost.
+#   Part B removes ONLY that directive, and ONLY for the onion host, by editing
+#   the built CSP directives (NOT by overriding force_https, which would affect
+#   redirects / cookies / URL generation for the whole request). Clearnet is
+#   unaffected. The onion is identified by Part A's already-validated per-request
+#   hostname, so Part B inherits Part A's EnforceHostname prerequisite and stays
+#   inert without it.
 # .
 # SiteSetting.force_hostname keeps its upstream precedence -- if set, Part A's
 # thread-local short-circuits and the URL fix does not take effect.
@@ -113,42 +112,44 @@ class ::MultiHostnameRailtie < Rails::Railtie
 end
 
 # ---------------------------------------------------------------------------
-# Part B: per-host CSP (force_https treated as false on .onion requests)
+# Part B: per-host CSP (drop upgrade-insecure-requests on .onion requests)
 # ---------------------------------------------------------------------------
 
-module ::OnionCspRequestScope
-  # Wrap the CSP middleware: for a .onion request, mark a thread-local for the
-  # duration of super (which builds and sets the CSP header). Nothing outside
-  # CSP building observes the flag, so force_https keeps its normal effect on
-  # redirects, secure cookies, etc.
-  def call(env)
-    host = Rack::Request.new(env).host.to_s
-    return super unless host.end_with?(".onion")
-
-    Thread.current[:csp_onion_request] = true
-    begin
-      super
-    ensure
-      Thread.current[:csp_onion_request] = nil
-    end
-  end
-end
-
-module ::OnionForceHttpsScope
-  # While building CSP for a .onion request, report force_https as false so the
-  # base_url protocol resolves via request.ssl? (http for the onion vhost) and
-  # upgrade-insecure-requests is omitted. Untouched otherwise.
-  #
-  # Signature-agnostic: Discourse's generated SiteSetting accessor is called
-  # with arguments in some code paths, so accept and forward everything to
-  # super (a fixed 0-arg override crashed boot with ArgumentError).
-  def force_https(*args, **kwargs, &blk)
-    return false if Thread.current[:csp_onion_request]
+# With SiteSetting.force_https on (any HTTPS clearnet site), Discourse's CSP adds
+# `upgrade-insecure-requests`, which forces every subresource fetch to https and
+# breaks an http:// onion vhost. We remove ONLY that directive, and ONLY for the
+# onion host.
+#
+# Design (addresses three failure modes of a force_https override):
+#   * We do NOT override SiteSetting.force_https. Scoping a force_https=false
+#     around the CSP middleware's `call` would span the whole downstream
+#     `@app.call`, wrongly affecting redirects, secure-cookie flags and URL
+#     generation for the entire request -- not just CSP. Editing the built CSP
+#     directives touches only the header.
+#   * The host is Part A's already-VALIDATED per-request hostname
+#     (Thread.current[:discourse_request_hostname], stashed by
+#     MultiHostnameMiddleware from env[HTTP_HOST] AFTER Middleware::EnforceHostname
+#     validated it) -- NOT the spoofable Rack::Request#host / X-Forwarded-Host.
+#   * If EnforceHostname is unavailable, Part A does not install its middleware,
+#     so the thread-local stays nil and Part B is inert: an attacker-supplied
+#     `*.onion` Host header cannot activate it. (Same prerequisite as Part A.)
+#
+# Only upgrade-insecure-requests depends on the request scheme in Discourse's
+# DEFAULT CSP; base_url is not interpolated into any default directive
+# (script-src is 'strict-dynamic' 'wasm-unsafe-eval'; other sources are 'self' /
+# 'none' / 'blob:'), so no per-host http origin rewrite is needed.
+module ::OnionCspDropUpgradeInsecure
+  # Signature-agnostic (forward everything to super): the upstream
+  # ContentSecurityPolicy::Default#initialize signature has varied across
+  # Discourse versions (e.g. base_url:), and a hard-coded keyword list would
+  # raise ArgumentError and break CSP generation site-wide on an upgrade.
+  def initialize(*args, **kwargs, &blk)
     super
+    host = Thread.current[::MultiHostnameThreadLocal::KEY].to_s.downcase.chomp(".")
+    @directives.delete(:upgrade_insecure_requests) if host.end_with?(".onion")
   end
 end
 
 after_initialize do
-  ::ContentSecurityPolicy::Middleware.prepend(::OnionCspRequestScope)
-  ::SiteSetting.singleton_class.prepend(::OnionForceHttpsScope)
+  ::ContentSecurityPolicy::Default.prepend(::OnionCspDropUpgradeInsecure)
 end
